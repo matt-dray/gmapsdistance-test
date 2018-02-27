@@ -1,0 +1,183 @@
+---
+title: "The Google Maps API with `gmapsdistance`"
+subtitle: 'Testing with school postcode data'
+author: "Matt Dray"
+date: '`r format(Sys.time(), "%d %B %Y")`'
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Background
+
+How long does it take to get from point A to point B? We rarely travel in a straight line, so measuring this distance often isn't helpful; we are likely to underetsimate the actual time and distance taken when using transport. We can use the [Google Maps](https://www.google.co.uk/maps) [Application Programming Interface](https://medium.freecodecamp.org/what-is-an-api-in-english-please-b880a3214a82) (API) -- wrapped in an R package called `gmapsdistance` -- to query Google Maps with This is simpler than manually inputting addresses to Google Maps via the browser.
+
+We can supply a sequence of origin and destination points and have all the results returned as an R list-class object for easy analysis. Distances (metres) and journey duration (seconds) are returned, having selected from three transport modes: on foot, by car, or by public transport. (Also by bicycle for parts of North America only.)
+
+Information on the `gmapsdistance` package:
+
+* [gmapsdistance examples](https://github.com/rodazuero/gmapsdistance)
+* [package documentation](https://cran.r-project.org/web/packages/gmapsdistance/gmapsdistance.pdf)
+
+Note that the local authorities and schools mentioned here were chosen arbitrarily and randomly; they have no particular significance.
+
+# Prepare the workspace
+
+Install the packages in the form `install.packages("gmapsdistance")` and load with:
+
+```{r packages, message=FALSE, warning=FALSE}
+library(gmapsdistance)  # for getting info from the API
+library(dplyr)  # for data manipulation and pipes (%>%)
+```
+
+# Get a school sample 
+
+We'll read in secondary schools data from two local authorities (Cambridgeshire and Cumbria) and sample five from each. We need only details of the schoosl name and location and will be using the postcode as our origin and destination point information. The data are from the [Get Information About Schools](https://get-information-schools.service.gov.uk/) service.
+
+I have previously saved a version of the GIAS dataset as an RDS file, which is what is read in below. I had prepared this file using the `janitor::clean_names()` function to tidy the column names, hence the lower case and underscores.
+
+```{r gias-sample}
+set.seed(1337)  # for reproducibility of our sample
+
+# Read data from Get Information About Schools
+# Randomly sample a couple of schools from a couple of local authorities
+
+gias_raw <- readRDS("data/gias_raw.RDS") 
+
+gias <- gias_raw %>% 
+  dplyr::select(  # select columns of interest
+    urn, establishmentname, phaseofeducation_name,  # school
+    la_name,  # local authority
+    street, locality, address3, town, county_name, postcode,  # address
+    easting, northing  # bng co-ordinates
+  ) %>%
+  dplyr::mutate(postcode = tolower(gsub(" ", "", postcode))) %>%  # simplify
+  dplyr::filter(
+    phaseofeducation_name == "Secondary",  # only secondaries
+    la_name %in% c("Cambridgeshire", "Cumbria"),  # only these two LAs
+    !(is.na(postcode))  # remove where postcode == NA
+  ) %>% 
+  dplyr::group_by(la_name) %>%  # within each local authority 
+  dplyr::sample_n(5) %>%  # randomly sample five schools
+  dplyr::ungroup()
+
+dplyr::glimpse(gias)  # check out the data
+```
+
+# Calculate distances
+
+Create separate dataframes of postcodes for the two local authorities, then pass these to the Google Maps API with the `gmpasdistance()` function. The basic arguments to this function are the origin and destination (can be an address, postcode or latlong coordinates), the mode of travel (car, public transit, walking) and the return format (shape) of the data (each origin-destination pair per row, or a matrix). You can find more about the arguments by executing `?gmapsdistance`.
+
+```{r gmapsdistance, cache=TRUE}
+# Vectors of postcodes for each local authority
+
+cam_pcd <- gias %>% 
+  dplyr::filter(la_name == "Cambridgeshire") %>%   # only schools in this LA
+  dplyr::select(postcode) %>%  # we just want postcode data
+  dplyr::pull()  # pull vector from dataframe
+
+cum_pcd <- gias %>% 
+  dplyr::filter(la_name == "Cumbria") %>% 
+  dplyr::select(postcode) %>% 
+  dplyr::pull()
+
+# Call the API
+
+sch_distances <- gmapsdistance::gmapsdistance(
+  origin = cam_pcd,  # start point of journey
+  destination = cum_pcd,  # end point of journey
+  mode = "driving",  # driving time
+  shape = "long"  # format of output data (origin and destination as cols)
+)
+```
+
+The output is a list of three elements (in this order:
+
+1. Time (seconds)
+2. Distance (metres)
+3. Status (i.e. could the calculation be made?)
+
+Each list element has three columns:
+
+* `or` -- the origin point
+* `de` -- the destination point
+* one of `Time`, `Distance` and `Status`
+
+Let's start with `Status`. Were all the requests actioned?
+
+```{r status}
+sch_distances$Status  # isolate status element of returned list
+```
+
+We want the status `OK`, which indicates that there were no problems and the distances were collected with no errors. The `PLACE_NOT_FOUND` error is returned in the `Status` column when Google Maps can't locate your origin or destination.
+
+So what were the distances between the locations in metres?
+
+```{r distance}
+sch_distances$Distance  # isolate distance (metres) element of returned list
+```
+
+And how much time does this translate to, in seconds, when driving between the locations?
+
+```{r time}
+sch_distances$Time  # isolate time (seconds) element of returned list
+```
+
+That's great, but still not super-friendly to use, especially over long distances.
+
+# Manipulate the data
+
+Let's create a more meaningful table for our purposes. Let's say we only care about the distances for now, so we'll focus on that element of the list and join in information about the origin from the Get Information About Schools data
+
+```{r list-to-df, warning=FALSE}
+distance_info <- sch_distances$Distance %>%  # to the distance data...
+  dplyr::left_join(
+    y = select(
+      gias, 
+      establishmentname, postcode  # join these columns from the GIAS data
+      ),   
+    by = c("or" = "postcode")  # match on postcode values (origin)
+  ) %>% 
+  dplyr::left_join(   # now join...
+    y = select(
+      gias,  # from GIAS...
+      establishmentname, postcode  # these columns
+      ),
+    by = c("de" = "postcode"),  # match on postcode values (destination)
+    suffix = c("_or", "_de")  # add col name suffixes for origin/destination
+  )
+
+dplyr::glimpse(distance_info)  # inspect data
+```
+
+While we're at it, we can look arbitrarily at the longest distances.
+
+```{r arrange}
+distance_info %>%
+  dplyr::mutate(  # create new columns
+    Kilometres = round(Distance/1000, 1),  # calculate km from m
+    Miles = round(Kilometres * 0.621371, 1)  # convert to miles
+  ) %>% 
+  dplyr::select(  # select columns to rename and retain
+    Origin = establishmentname_or,
+    Destination = establishmentname_de,
+    `Kilometres`,
+    `Miles`
+    ) %>% 
+  dplyr::arrange(desc(Kilometres)) # arrange by longest distance first
+```
+
+<p>
+
+Manually inputting Melbourn Village College, Cambridgeshire, and Netherhall School, Cumbria, into [Google Maps suggests](https://www.google.co.uk/maps/dir/Melbourn+Village+College,+The+Moor,+Melbourn,+Royston+SG8+6EF/Netherhall+School,+Maryport+CA15+6NT/@53.4024353,-2.8030311,8z/data=!4m14!4m13!1m5!1m1!1s0x47d87f4170410127:0x8a099daa490f413!2m2!1d0.018509!2d52.0876171!1m5!1m1!1s0x48632ab69daa9c31:0x4ff19abcbbbd1017!2m2!1d-3.484959!2d54.7180064!3e2) 283 miles, as expected from the `gmapsdistance()` output. *Success!*
+
+<img src="img/distance.png" alt="Google Maps directions" style="width:900px;>
